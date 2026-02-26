@@ -1,0 +1,8 @@
+## How It Works
+
+1. Show one barcode to the camera.
+2. App detects the barcode-like shape.
+3. App reads the ISBN barcode.
+4. App looks up title and author online.
+5. App saves the result to CSV.
+6. If the ISBN is already in the file, it skips it.
