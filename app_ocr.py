@@ -310,6 +310,14 @@ class ShapeDetector:
 class OcrIsbnReader:
     """Extracts ISBN text from an image ROI using Tesseract OCR."""
 
+    PER_CALL_TIMEOUT_SEC = 0.85
+    TOTAL_SCAN_BUDGET_SEC = 5.5
+    MAX_OCR_CALLS = 48
+    FAST_SCAN_BUDGET_SEC = 2.0
+    FAST_MAX_OCR_CALLS = 16
+    DEEP_SCAN_BUDGET_SEC = 5.5
+    DEEP_MAX_OCR_CALLS = 48
+
     def __init__(self) -> None:
         self._configure_tesseract()
 
@@ -408,19 +416,45 @@ class OcrIsbnReader:
             regions.append(roi[: int(h * 0.35), :])    # top ISBN text (if present)
         return [region for region in regions if region.size > 0]
 
-    def read_isbn13(self, roi) -> Optional[str]:
+    def read_isbn13(
+        self,
+        roi,
+        deadline: Optional[float] = None,
+        *,
+        per_call_timeout: Optional[float] = None,
+        max_ocr_calls: Optional[int] = None,
+    ) -> Optional[str]:
         configs = [
             r"--oem 3 --psm 7 -c tessedit_char_whitelist=0123456789Xx- ",
             r"--oem 3 --psm 6 -c tessedit_char_whitelist=0123456789Xx- ",
             r"--oem 3 --psm 11 -c tessedit_char_whitelist=0123456789Xx- ",
         ]
+        if deadline is None:
+            deadline = time.perf_counter() + self.TOTAL_SCAN_BUDGET_SEC
+        if per_call_timeout is None:
+            per_call_timeout = self.PER_CALL_TIMEOUT_SEC
+        if max_ocr_calls is None:
+            max_ocr_calls = self.MAX_OCR_CALLS
+
+        ocr_calls = 0
         for region in self._barcode_text_regions(roi):
             variants = self._variants(region)
             for variant in variants:
                 for config in configs:
+                    if ocr_calls >= max_ocr_calls:
+                        return None
+                    remaining = deadline - time.perf_counter()
+                    if remaining <= 0:
+                        return None
+                    timeout = min(per_call_timeout, max(0.25, remaining))
+                    ocr_calls += 1
                     try:
-                        text = pytesseract.image_to_string(variant, config=config)
-                    except pytesseract.TesseractError:
+                        text = pytesseract.image_to_string(
+                            variant,
+                            config=config,
+                            timeout=timeout,
+                        )
+                    except (pytesseract.TesseractError, RuntimeError):
                         continue
                     isbn13 = self._extract_isbn13(text)
                     if isbn13:
@@ -517,14 +551,38 @@ class SmartLibraryOcrApp:
             self._set_status("Invalid scan region. Reposition barcode.", hold_seconds=1.5)
             return
 
-        isbn13 = self.ocr.read_isbn13(roi)
-        if not isbn13:
-            wide_roi = self._expanded_roi(frame, bounds, expand_ratio=0.25)
-            if wide_roi.size > 0:
-                isbn13 = self.ocr.read_isbn13(wide_roi)
+        wide_roi = self._expanded_roi(frame, bounds, expand_ratio=0.25)
+
+        fast_deadline = time.perf_counter() + self.ocr.FAST_SCAN_BUDGET_SEC
+        isbn13 = self.ocr.read_isbn13(
+            roi,
+            deadline=fast_deadline,
+            max_ocr_calls=self.ocr.FAST_MAX_OCR_CALLS,
+        )
+        if not isbn13 and wide_roi.size > 0:
+            isbn13 = self.ocr.read_isbn13(
+                wide_roi,
+                deadline=fast_deadline,
+                max_ocr_calls=self.ocr.FAST_MAX_OCR_CALLS,
+            )
 
         if not isbn13:
-            self._set_status("OCR failed. Hold steady and press S again.", hold_seconds=1.5)
+            self._set_status("Retrying OCR...", hold_seconds=0.7)
+            deep_deadline = time.perf_counter() + self.ocr.DEEP_SCAN_BUDGET_SEC
+            isbn13 = self.ocr.read_isbn13(
+                roi,
+                deadline=deep_deadline,
+                max_ocr_calls=self.ocr.DEEP_MAX_OCR_CALLS,
+            )
+            if not isbn13 and wide_roi.size > 0:
+                isbn13 = self.ocr.read_isbn13(
+                    wide_roi,
+                    deadline=deep_deadline,
+                    max_ocr_calls=self.ocr.DEEP_MAX_OCR_CALLS,
+                )
+
+        if not isbn13:
+            self._set_status("No ISBN detected. Hold steady and press S again.", hold_seconds=1.5)
             return
 
         if self.visible_lock_isbn == isbn13:
